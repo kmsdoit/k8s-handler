@@ -1,0 +1,109 @@
+---
+- hosts: all
+  become: yes
+  tasks:
+    - name: Swap 비활성화
+      command: swapoff -a
+      ignore_errors: yes
+
+    - name: Swap 항목 주석처리
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*swap.*)$'
+        replace: '# \1'
+
+    - name: 필수 패키지 설치
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: containerd 설치
+      apt:
+        name: containerd
+        state: present
+        update_cache: yes
+
+    - name: Kubernetes GPG 키 등록
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Kubernetes 저장소 추가
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+        filename: "kubernetes"
+        state: present
+
+    - name: Kubernetes 패키지 설치
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: kubelet 부팅시 자동시작
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+- hosts: control_plane
+  become: yes
+  tasks:
+    - name: Control Plane 초기화
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      register: kubeadm_init
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: idb 홈디렉토리 생성
+      file:
+        path: /home/idb/.kube
+        state: directory
+        owner: idb
+        group: idb
+        mode: 0700
+
+    - name: kubeconfig 복사
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/idb/.kube/config
+        remote_src: yes
+        owner: idb
+        group: idb
+        mode: 0600
+
+    - name: Flannel 네트워크 설치
+      become: false
+      become_user: idb
+      shell: |
+        kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /home/idb/.kube/config
+
+    - name: Join 명령 추출
+      shell: kubeadm token create --print-join-command
+      register: join_command
+      changed_when: false
+
+    - name: Join 명령 저장
+      set_fact:
+        worker_join_command: "{{ join_command.stdout }}"
+
+- hosts: workers
+  become: yes
+  tasks:
+    - name: Control Plane에서 받은 Join 명령 실행
+      shell: "{{ hostvars['control-plane']['worker_join_command'] }} --ignore-preflight-errors=all"
+      args:
+        creates: /etc/kubernetes/kubelet.conf 
